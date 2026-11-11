@@ -1,0 +1,734 @@
+import asyncio
+import base64
+import hashlib
+import io
+import math
+import os
+import tempfile
+import threading
+import time
+import urllib.parse
+from copy import deepcopy
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+from base_plugin import BasePlugin, command, Header, Input, Button, Text
+from mokagram_sdk import api
+
+try:
+    from PIL import Image, ImageColor, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
+except Exception as _e:  # Pillow не загрузился: будет текстовая карточка
+    Image = None
+    _PIL_ERR = "%s: %s" % (type(_e).__name__, _e)
+
+__id__ = "spotify"
+__name__ = "Spotify"
+__description__ = "Команда .now отправляет карточку с треком, который играет в Spotify"
+__author__ = "you"
+__version__ = "2.2.0"
+__icon__ = "<tg-emoji emoji-id="5276089339967716971">📣</tg-emoji>"
+__permissions__ = ["network", "storage", "messages.send", "messages.read", "messages.edit"]
+__details__ = (
+    "Как подключить:\n"
+    "1. Заходим в https://developer.spotify.com/dashboard/create и создаем аппку(сначала в местах ссылки ставь рандом ссылки)\n"
+    "2. После нажимаем Edit и меняем Redirect URL на http://127.0.0.1:8888/callback\n"
+    "3. Копируем Client ID и в настройках плагина вставляем в свое место, потом подключаемся к Spotify по кнопке\n"
+    "4. Когда играет песенка пишем в чатах .now и он дает секс карточку с твоей музыкой\n"
+    "Для создания карточки нужен Pillow, тутор - "
+)
+
+REDIRECT_PORT = 8888
+REDIRECT_URI = f"http://127.0.0.1:{REDIRECT_PORT}/callback"
+SCOPES = "user-read-currently-playing user-read-playback-state"
+AUTH_URL = "https://accounts.spotify.com/authorize"
+TOKEN_URL = "https://accounts.spotify.com/api/token"
+NOW_URL = "https://api.spotify.com/v1/me/player/currently-playing?additional_types=episode"
+FORM = {"Content-Type": "application/x-www-form-urlencoded"}
+
+
+# =====================================================================
+# Рендер карточки (код из вложения; изменено: render_card принимает
+# готовую обложку, убрана демо-обложка с диска, добавлены шрифты)
+# =====================================================================
+
+DEFAULT = {
+    'version': 2, 'theme': 'studio', 'preset': 'banner', 'width': 1500, 'height': 600,
+    'title': 'Dead Limit', 'artist': 'Noisia, The Upbeats', 'subtitle': '', 'duration': 361, 'progress': 40,
+    'backgroundColor': '#111111', 'nameColor': '#ffffff', 'authorColor': '#b3b3b3',
+    'progressColor': '#ffffff', 'progressBarColor': '#777777', 'radius': 0,
+    'blur': 40, 'brightness': .35, 'artBackground': True, 'thumbnail': '',
+    'coverRadius': 30, 'coverBorder': 0, 'glow': 0, 'uppercase': False,
+    'align': 'left', 'progressStyle': 'line', 'timeMode': 'sides', 'timeSize': 26,
+    'layout': {
+        'cover': {'x': 60, 'y': 60, 'size': 480, 'rotation': 0, 'flip': False},
+        'title': {'x': 600, 'y': 195, 'size': 55},
+        'artist': {'x': 600, 'y': 280, 'size': 45},
+        'progress': {'x': 692, 'y': 384, 'width': 659, 'height': 10},
+    },
+}
+PRESETS = {
+    'banner': {},
+    'center': {
+        'width': 1600, 'height': 900, 'align': 'center', 'coverRadius': 0, 'coverBorder': 4,
+        'blur': 65, 'brightness': .3, 'timeMode': 'center', 'timeSize': 28,
+        'layout': {'cover': {'x': 650, 'y': 100, 'size': 300}, 'title': {'x': 800, 'y': 450, 'size': 56},
+                   'artist': {'x': 800, 'y': 516, 'size': 40}, 'progress': {'x': 120, 'y': 690, 'width': 1360, 'height': 16}},
+    },
+    'glow': {
+        'width': 2048, 'height': 976, 'align': 'center', 'coverRadius': 36, 'glow': 55,
+        'blur': 75, 'brightness': .4, 'progressStyle': 'wave', 'timeSize': 32, 'uppercase': True,
+        'layout': {'cover': {'x': 824, 'y': 128, 'size': 400}, 'title': {'x': 1024, 'y': 574, 'size': 80},
+                   'artist': {'x': 1024, 'y': 720, 'size': 50}, 'progress': {'x': 700, 'y': 886, 'width': 640, 'height': 36}},
+    },
+    'minimal': {
+        'width': 1280, 'height': 533, 'coverRadius': 26, 'blur': 50, 'brightness': .25,
+        'timeMode': 'below', 'timeSize': 28,
+        'layout': {'cover': {'x': 67, 'y': 67, 'size': 400}, 'title': {'x': 525, 'y': 88, 'size': 52},
+                   'artist': {'x': 525, 'y': 160, 'size': 36}, 'progress': {'x': 525, 'y': 409, 'width': 688, 'height': 9}},
+    },
+}
+THEMES = tuple(PRESETS)
+
+
+def preset_config(name):
+    if name not in PRESETS:
+        raise ValueError('Неизвестный вариант карточки')
+    result = deepcopy(DEFAULT)
+    for key, value in PRESETS[name].items():
+        if key != 'layout':
+            result[key] = value
+    for element, values in PRESETS[name].get('layout', {}).items():
+        result['layout'][element].update(values)
+    result['preset'] = name
+    return result
+
+
+def font(size, bold=False):
+    paths = [Path('C:/Windows/Fonts') / ('arialbd.ttf' if bold else 'arial.ttf'),
+             Path('/System/Library/Fonts/Supplemental') / ('Arial Bold.ttf' if bold else 'Arial.ttf'),
+             Path('/usr/share/fonts/truetype/dejavu') / ('DejaVuSans-Bold.ttf' if bold else 'DejaVuSans.ttf'),
+             Path('/usr/share/fonts/truetype/liberation') / ('LiberationSans-Bold.ttf' if bold else 'LiberationSans-Regular.ttf')]
+    for path in paths:
+        if path.exists():
+            return ImageFont.truetype(str(path), max(1, round(size)))
+    return ImageFont.load_default(size=max(1, round(size)))
+
+
+def number(value, minimum, maximum):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError('Нужны конечные числовые значения')
+    return max(minimum, min(maximum, value))
+
+
+def merge_config(value):
+    if not isinstance(value, dict):
+        raise ValueError('Нужен объект настроек')
+    if value.get('version') == 1:
+        value = {key: value[key] for key in ('title', 'artist', 'duration', 'progress', 'thumbnail') if key in value}
+    result = preset_config(value.get('preset', 'banner'))
+    for key in DEFAULT:
+        if key in value and key != 'layout':
+            result[key] = value[key]
+    layout = value.get('layout', {})
+    if not isinstance(layout, dict):
+        raise ValueError('Неверная компоновка')
+    for name, defaults in DEFAULT['layout'].items():
+        item = layout.get(name, {})
+        if not isinstance(item, dict):
+            raise ValueError('Неверные параметры элемента')
+        result['layout'][name].update({key: item[key] for key in defaults if key in item})
+    result['version'], result['theme'] = 2, 'studio'
+    result['width'] = round(number(result['width'], 400, 2560))
+    result['height'] = round(number(result['height'], 200, 1440))
+    for key in ('title', 'artist', 'subtitle'):
+        if not isinstance(result[key], str):
+            raise ValueError('Название и исполнитель должны быть текстом')
+    for key in ('backgroundColor', 'nameColor', 'authorColor', 'progressColor', 'progressBarColor'):
+        if not isinstance(result[key], str):
+            raise ValueError('Неверный цвет')
+        ImageColor.getrgb(result[key])
+    for key, minimum, maximum in (('duration', 1, 86400), ('progress', 0, 100), ('radius', 0, 200),
+                                 ('blur', 0, 120), ('brightness', .05, 1), ('coverRadius', 0, 200),
+                                 ('coverBorder', 0, 20), ('glow', 0, 120), ('timeSize', 12, 80)):
+        result[key] = number(result[key], minimum, maximum)
+    for key in ('artBackground', 'uppercase'):
+        if type(result[key]) is not bool:
+            raise ValueError('Неверное значение флага')
+    for key, choices in (('align', ('left', 'center')), ('progressStyle', ('line', 'wave')), ('timeMode', ('sides', 'below', 'center', 'none'))):
+        if result[key] not in choices:
+            raise ValueError('Неверный режим оформления')
+    for item in result['layout'].values():
+        for key in item:
+            if key == 'flip':
+                if type(item[key]) is not bool:
+                    raise ValueError('Неверное отражение')
+            else:
+                bounds = (8, 1200) if key == 'size' else (40, 2400) if key == 'width' else (2, 100) if key == 'height' else (-180, 180) if key == 'rotation' else (-2560, 5120)
+                item[key] = number(item[key], *bounds)
+    if not isinstance(result['thumbnail'], str) or len(result['thumbnail']) > 12_000_000:
+        raise ValueError('Неверная обложка')
+    return result
+
+
+def clock(seconds):
+    minutes, seconds = divmod(max(0, int(seconds)), 60)
+    return f'{minutes:02d}:{seconds:02d}'
+
+
+def fit_text(draw, text, face, max_width):
+    text = ' '.join(text.split())
+    if draw.textlength(text, font=face) <= max_width:
+        return text
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if draw.textlength(text[:middle] + '…', font=face) <= max_width:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low] + '…' if low else ''
+
+
+def wave_height(index):
+    return .2 + .8 * abs(math.sin(index * 12.9898 + 78.233)) * math.sin(math.pi * (index + 1) / 65) ** .35
+
+
+def render_card(value, cover):
+    c = merge_config(value)
+    size = (c['width'], c['height'])
+    if c['artBackground']:
+        image = cover.resize(size, Image.Resampling.LANCZOS).filter(ImageFilter.GaussianBlur(c['blur']))
+        image = ImageEnhance.Brightness(image).enhance(c['brightness']).convert('RGBA')
+    else:
+        image = Image.new('RGBA', size, c['backgroundColor'])
+    p = c['layout']['cover']
+    s = round(p['size'])
+    art = ImageOps.fit(cover, (s, s), method=Image.Resampling.LANCZOS).convert('RGBA')
+    if p['flip']:
+        art = ImageOps.mirror(art)
+    mask = Image.new('L', (s, s))
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, s-1, s-1), radius=c['coverRadius'], fill=255)
+    art.putalpha(mask)
+    if c['coverBorder']:
+        ImageDraw.Draw(art).rounded_rectangle((0, 0, s-1, s-1), radius=c['coverRadius'], outline=c['nameColor'], width=round(c['coverBorder']))
+    art = art.rotate(-p['rotation'], Image.Resampling.BICUBIC, expand=True)
+    pos = (round(p['x'] + (s-art.width)/2), round(p['y'] + (s-art.height)/2))
+    if c['glow']:
+        halo = Image.new('RGBA', size)
+        halo.alpha_composite(art, pos)
+        image.alpha_composite(halo.filter(ImageFilter.GaussianBlur(c['glow'])))
+    image.alpha_composite(art, pos)
+    draw = ImageDraw.Draw(image)
+    centered = c['align'] == 'center'
+    for name, color in (('title', 'nameColor'), ('artist', 'authorColor')):
+        p = c['layout'][name]
+        face = font(p['size'], name == 'title' or c['preset'] == 'glow')
+        max_width = max(0, 2*min(p['x'], size[0]-p['x'])-40 if centered else size[0]-p['x']-40)
+        text = c[name].upper() if c['uppercase'] else c[name]
+        draw.text((p['x'], p['y']), fit_text(draw, text, face, max_width), font=face, fill=c[color], anchor='mt' if centered else 'lt')
+    p = c['layout']['progress']
+    x, y, width, height = p['x'], p['y'], p['width'], p['height']
+    if c['progressStyle'] == 'wave':
+        for index in range(64):
+            h = max(3, height * wave_height(index))
+            bx, bw = x + index * width / 64, max(2, width / 64 * .55)
+            color = c['progressColor'] if index/64 < c['progress']/100 else c['progressBarColor']
+            draw.rounded_rectangle((bx, y+(height-h)/2, bx+bw, y+(height+h)/2), radius=bw/2, fill=color)
+    else:
+        draw.rounded_rectangle((x, y, x+width, y+height), radius=height/2, fill=c['progressBarColor'])
+        filled = width * c['progress']/100
+        if filled:
+            draw.rounded_rectangle((x, y, x+filled, y+height), radius=min(height/2, filled/2), fill=c['progressColor'])
+    elapsed, duration = clock(c['duration']*c['progress']/100), clock(c['duration'])
+    face = font(c['timeSize'], c['timeMode'] in ('sides', 'center'))
+    if c['timeMode'] == 'center':
+        draw.text((x+width/2, y+height+20), f'({elapsed} | {duration})', font=face, fill=c['nameColor'], anchor='mt')
+    elif c['timeMode'] in ('sides', 'below'):
+        side = c['timeMode'] == 'sides'
+        for tx, text, anchor in ((x-26 if side else x, elapsed, 'rm' if side else 'lt'), (x+width+26 if side else x+width, duration, 'lm' if side else 'rt')):
+            draw.text((tx, y+height/2 if side else y+height+20), text, font=face, fill=c['nameColor'] if side else c['authorColor'], anchor=anchor)
+    if c['subtitle']:
+        draw.text((size[0]/2, size[1]-48), fit_text(draw, c['subtitle'], font(34), size[0]-80), font=font(34), fill=c['authorColor'], anchor='mt')
+    if c['radius']:
+        mask = Image.new('L', size)
+        ImageDraw.Draw(mask).rounded_rectangle((0, 0, size[0]-1, size[1]-1), radius=c['radius'], fill=255)
+        image.putalpha(mask)
+    return image
+
+
+# =====================================================================
+# Вспомогательные функции плагина
+# =====================================================================
+
+def _u16(s):
+    """Длина строки в UTF-16 code units (так считает Telegram)."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+def _b64url(b):
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+
+def _fmt_ms(ms):
+    m, s = divmod(int(ms) // 1000, 60)
+    return f"{m}:{s:02d}"
+
+
+def _bar(progress, duration, width=12):
+    if not duration:
+        return ""
+    filled = max(0, min(width, round(width * progress / duration)))
+    return "▰" * filled + "▱" * (width - filled)
+
+
+class _Text:
+    """Накопитель текста с entities (смещения в UTF-16)."""
+
+    def __init__(self):
+        self.text = ""
+        self.ents = []
+
+    def add(self, s, **ent):
+        start = _u16(self.text)
+        self.text += s
+        if ent:
+            e = {"offset": start, "length": _u16(s)}
+            e.update(ent)
+            self.ents.append(e)
+        return start
+
+    def wrap(self, start, **ent):
+        e = {"offset": start, "length": _u16(self.text) - start}
+        e.update(ent)
+        self.ents.append(e)
+
+    def result(self):
+        self.ents.sort(key=lambda e: (e["offset"], -e["length"]))
+        return self.text, self.ents
+
+
+def track_info(data):
+    """Ответ currently-playing -> dict с полями трека или None."""
+    item = (data or {}).get("item")
+    if not item:
+        return None
+    if item.get("type") == "episode":
+        show = item.get("show") or {}
+        artist = show.get("name", "")
+        extra = show.get("publisher", "")
+        images = item.get("images") or show.get("images") or []
+    else:
+        artist = ", ".join(a.get("name", "") for a in item.get("artists", []))
+        album = item.get("album") or {}
+        extra = album.get("name", "")
+        images = album.get("images") or []
+    images = sorted(images, key=lambda i: i.get("width") or 0, reverse=True)
+    return {
+        "title": item.get("name", "?"),
+        "artist": artist,
+        "extra": extra,
+        "playing": data.get("is_playing", False),
+        "progress_ms": data.get("progress_ms") or 0,
+        "duration_ms": item.get("duration_ms") or 0,
+        "url": (item.get("external_urls") or {}).get("spotify"),
+        "cover_url": images[0].get("url") if images else None,
+    }
+
+
+def build_caption(info):
+    """⛧ <code>Трек — Артист</code> ⛧ -> (text, entities)."""
+    name = info["title"]
+    if info["artist"]:
+        name += " — " + info["artist"]
+    t = _Text()
+    t.add("⛧ ")
+    t.add(name, type="code")
+    t.add(" ⛧")
+    return t.result()
+
+
+def build_text_card(info):
+    """Запасной вариант без Pillow: текстовая карточка."""
+    t = _Text()
+    t.add("🎧 ")
+    t.add("Сейчас играет" if info["playing"] else "На паузе", type="bold")
+    t.add("\n")
+    q = _u16(t.text)
+    if info["url"]:
+        t.add(info["title"], type="link", url=info["url"])
+    else:
+        t.add(info["title"], type="bold")
+    if info["artist"]:
+        t.add("\n" + info["artist"])
+    if info["extra"]:
+        t.add("\n")
+        t.add(info["extra"], type="italic")
+    if info["duration_ms"]:
+        t.add(f"\n{'▶' if info['playing'] else '⏸'} {_bar(info['progress_ms'], info['duration_ms'])} "
+              f"{_fmt_ms(info['progress_ms'])} / {_fmt_ms(info['duration_ms'])}")
+    t.wrap(q, type="quote")
+    return t.result()
+
+
+def render_jpeg(info, preset, cover_bytes):
+    """Рисует карточку и сохраняет во временный JPEG, возвращает путь."""
+    cover = None
+    if cover_bytes:
+        try:
+            with Image.open(io.BytesIO(cover_bytes)) as im:
+                cover = ImageOps.exif_transpose(im).convert("RGB")
+        except Exception:
+            cover = None
+    if cover is None:
+        cover = Image.new("RGB", (640, 640), "#222222")
+
+    duration = max(1.0, info["duration_ms"] / 1000)
+    percent = max(0.0, min(100.0, info["progress_ms"] / 1000 / duration * 100))
+    cfg = {
+        "preset": preset if preset in PRESETS else "banner",
+        "title": info["title"],
+        "artist": info["artist"],
+        "duration": duration,
+        "progress": percent,
+        "radius": 0,  # фото в Telegram без прозрачности, углы не скругляем
+    }
+    image = render_card(cfg, cover).convert("RGB")
+    path = os.path.join(tempfile.gettempdir(),
+                        f"spotify_now_{os.getpid()}_{int(time.time() * 1000)}.jpg")
+    image.save(path, "JPEG", quality=92)
+    return path
+
+
+# =====================================================================
+# Плагин
+# =====================================================================
+
+class SpotifyNow(BasePlugin):
+    strings = {
+        "ru": {
+            "hdr": "Spotify",
+            "client_id": "Client ID приложения Spotify",
+            "preset": "Вид карточки: banner, center, glow или minimal",
+            "redirect": "Redirect URI (нажми, чтобы скопировать)",
+            "login": "Войти в Spotify",
+            "logout": "Выйти из Spotify",
+            "on": "Подключено",
+            "off": "Не подключено",
+            "no_client": "Сначала вставь Client ID в настройках плагина",
+            "no_auth": "Spotify не подключён: Кастомизация → Плагины → Spotify Now",
+            "nothing": "Сейчас ничего не играет",
+            "browser": "Открыл браузер, подтверди доступ в Spotify",
+            "port_busy": "Порт {} занят, закрой программу, которая его использует",
+            "connected": "Spotify подключён",
+            "auth_fail": "Не удалось войти в Spotify: {}",
+            "logged_out": "Вышел из Spotify",
+            "rate": "Spotify просит подождать, попробуй позже",
+            "api_fail": "Ошибка Spotify: {}",
+            "no_pil": "Pillow не загрузился ({}), отправляю текстом",
+            "render_fail": "Не удалось нарисовать карточку, отправляю текстом",
+            "send_fail": "Не удалось отправить картинку, смотри .logs",
+        },
+        "en": {
+            "hdr": "Spotify",
+            "client_id": "Spotify app Client ID",
+            "preset": "Card style: banner, center, glow or minimal",
+            "redirect": "Redirect URI (tap to copy)",
+            "login": "Log in to Spotify",
+            "logout": "Log out of Spotify",
+            "on": "Connected",
+            "off": "Not connected",
+            "no_client": "Paste the Client ID in plugin settings first",
+            "no_auth": "Spotify is not connected: Customization → Plugins → Spotify Now",
+            "nothing": "Nothing is playing right now",
+            "browser": "Browser opened, approve access in Spotify",
+            "port_busy": "Port {} is busy, close the program using it",
+            "connected": "Spotify connected",
+            "auth_fail": "Spotify login failed: {}",
+            "logged_out": "Logged out of Spotify",
+            "rate": "Spotify rate limit, try again later",
+            "api_fail": "Spotify error: {}",
+            "no_pil": "Pillow failed to load ({}), sending text",
+            "render_fail": "Could not render the card, sending text",
+            "send_fail": "Could not send the picture, see .logs",
+        },
+    }
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._tok = None
+        self._exp = 0
+        self._pending = {}
+
+    # ----- утилиты -----
+
+    def _toast(self, text):
+        try:
+            api.show_toast(text)
+        except Exception:
+            self.logger.warning(text)
+
+    def _http(self, method, url, headers, body, cb):
+        kw = {"headers": headers, "callback": cb}
+        if body is not None:
+            kw["data"] = body
+        getattr(api.http, method)(url, **kw)
+
+    async def _http_async(self, method, url, headers=None, body=None):
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+
+        def done(res):
+            if not fut.done():
+                fut.set_result(res)
+
+        def cb(resp, err):
+            loop.call_soon_threadsafe(done, (resp, err))
+
+        self._http(method, url, headers or {}, body, cb)
+        return await asyncio.wait_for(fut, 30)
+
+    def _client_id(self):
+        return (self.get_setting("client_id", "") or "").strip()
+
+    # ----- токены -----
+
+    async def _access_token(self):
+        if self._tok and time.time() < self._exp - 30:
+            return self._tok
+        refresh = api.secrets.get("refresh_token")
+        if not refresh:
+            return None
+        body = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh,
+            "client_id": self._client_id(),
+        }
+        resp, err = await self._http_async("post", TOKEN_URL, FORM, body)
+        if err or resp is None:
+            self.logger.warning("token refresh failed: %s", err)
+            return None
+        if resp.status != 200:
+            self.logger.warning("token refresh status %s: %s", resp.status, resp.text)
+            if resp.status in (400, 401) and "invalid_grant" in (resp.text or ""):
+                api.secrets.delete("refresh_token")
+            return None
+        j = resp.json()
+        self._tok = j["access_token"]
+        self._exp = time.time() + int(j.get("expires_in", 3600))
+        if j.get("refresh_token"):
+            api.secrets.set("refresh_token", j["refresh_token"])
+        return self._tok
+
+    # ----- отправка картинки -----
+
+    def _send_photo(self, peer, path, caption, ents):
+        # send_file не принимает entities: запоминаем подпись, а когда сообщение
+        # уйдёт (on_message_sent), пробуем поправить её с моноширинным.
+        self._pending[caption] = (str(peer), ents)
+        if not api.send_file(peer, path, caption, as_photo=True):
+            self._pending.pop(caption, None)
+            self.logger.warning("send_file отказал, смотри .logs")
+            self._toast(self.s("send_fail"))
+            return
+
+        def cleanup():
+            self._pending.pop(caption, None)
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+        api.set_timeout(cleanup, 180)
+
+    def on_message_sent(self, info):
+        got = self._pending.pop(info.get("text"), None)
+        if not got or str(info.get("peer")) != got[0]:
+            return
+        ok = api.edit_message(info["peer"], info["id"], info["text"], got[1])
+        if not ok:
+            self.logger.warning("не удалось отформатировать подпись (edit_message)")
+
+    async def _cover_bytes(self, url):
+        if not url:
+            return None
+        try:
+            resp, err = await self._http_async("get", url)
+        except Exception as e:
+            self.logger.warning("cover download failed: %s", e)
+            return None
+        if err or resp is None or resp.status != 200:
+            self.logger.warning("cover download status: %s %s", getattr(resp, "status", None), err)
+            return None
+        return resp.content
+
+    # ----- команда -----
+
+    @command("now", "Карточка с текущим треком Spotify", aliases=["np"])
+    async def now_cmd(self, ctx):
+        # Ошибки показываем тостом и ничего не возвращаем, чтобы текст ошибки
+        # не попал в поле ввода и случайно не ушёл в чат.
+        for attempt in (1, 2):
+            token = await self._access_token()
+            if not token:
+                self._toast(self.s("no_auth"))
+                return None
+            resp, err = await self._http_async(
+                "get", NOW_URL, {"Authorization": "Bearer " + token})
+            if err or resp is None:
+                self._toast(self.s("api_fail", str(err)))
+                return None
+            if resp.status == 401 and attempt == 1:
+                self._tok = None
+                continue
+            break
+
+        if resp.status == 204:
+            self._toast(self.s("nothing"))
+            return None
+        if resp.status == 429:
+            self._toast(self.s("rate"))
+            return None
+        if resp.status != 200:
+            self.logger.warning("now-playing status %s: %s", resp.status, resp.text)
+            self._toast(self.s("api_fail", str(resp.status)))
+            return None
+
+        info = track_info(resp.json())
+        if info is None:
+            self._toast(self.s("nothing"))
+            return None
+
+        if Image is None:
+            import sys
+            err = globals().get("_PIL_ERR", "?")
+            self.logger.warning("PIL import failed: %s | sys.path=%s", err, sys.path[:8])
+            self._toast(self.s("no_pil", err[:150]))
+            return build_text_card(info)
+
+        try:
+            raw = await self._cover_bytes(info["cover_url"])
+            preset = (self.get_setting("preset", "banner") or "banner").strip().lower()
+            loop = asyncio.get_running_loop()
+            path = await loop.run_in_executor(None, render_jpeg, info, preset, raw)
+        except Exception:
+            self.logger.exception("render failed")
+            self._toast(self.s("render_fail"))
+            return build_text_card(info)
+
+        caption, ents = build_caption(info)
+        self._send_photo(ctx.peer, path, caption, ents)
+        return ""  # команда исчезает из поля ввода, фото уже ушло
+
+    # ----- авторизация (PKCE + локальный callback) -----
+
+    def _login(self, *_):
+        cid = self._client_id()
+        if not cid:
+            self._toast(self.s("no_client"))
+            return
+
+        verifier = _b64url(os.urandom(64))
+        challenge = _b64url(hashlib.sha256(verifier.encode()).digest())
+        state = _b64url(os.urandom(12))
+        result = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(h):
+                q = urllib.parse.urlparse(h.path)
+                if q.path != "/callback":
+                    h.send_response(404)
+                    h.end_headers()
+                    return
+                result.update(dict(urllib.parse.parse_qsl(q.query)))
+                page = ("<!doctype html><meta charset='utf-8'>"
+                        "<body style='font-family:sans-serif;text-align:center;margin-top:20vh'>"
+                        "<h2>Готово ✓</h2><p>Можно закрыть вкладку и вернуться в mokaGram.</p>")
+                data = page.encode()
+                h.send_response(200)
+                h.send_header("Content-Type", "text/html; charset=utf-8")
+                h.send_header("Content-Length", str(len(data)))
+                h.end_headers()
+                h.wfile.write(data)
+
+            def log_message(h, *args):
+                pass
+
+        try:
+            server = HTTPServer(("127.0.0.1", REDIRECT_PORT), Handler)
+        except OSError:
+            self._toast(self.s("port_busy", REDIRECT_PORT))
+            return
+        server.timeout = 5
+
+        def wait():
+            deadline = time.time() + 180
+            try:
+                while time.time() < deadline and "code" not in result and "error" not in result:
+                    server.handle_request()
+            finally:
+                server.server_close()
+
+            if "code" not in result:
+                self._toast(self.s("auth_fail", result.get("error", "timeout")))
+                return
+            if result.get("state") != state:
+                self._toast(self.s("auth_fail", "state mismatch"))
+                return
+
+            body = {
+                "grant_type": "authorization_code",
+                "code": result["code"],
+                "redirect_uri": REDIRECT_URI,
+                "client_id": cid,
+                "code_verifier": verifier,
+            }
+
+            def on_token(resp, err):
+                if err or resp is None or resp.status != 200:
+                    detail = err or (resp.text if resp is not None else "no response")
+                    self.logger.warning("code exchange failed: %s", detail)
+                    self._toast(self.s("auth_fail", str(detail)[:120]))
+                    return
+                j = resp.json()
+                api.secrets.set("refresh_token", j["refresh_token"])
+                self._tok = j["access_token"]
+                self._exp = time.time() + int(j.get("expires_in", 3600))
+                self._toast(self.s("connected"))
+
+            self._http("post", TOKEN_URL, FORM, body, on_token)
+
+        threading.Thread(target=wait, daemon=True).start()
+
+        params = urllib.parse.urlencode({
+            "client_id": cid,
+            "response_type": "code",
+            "redirect_uri": REDIRECT_URI,
+            "scope": SCOPES,
+            "state": state,
+            "code_challenge_method": "S256",
+            "code_challenge": challenge,
+        })
+        api.open_url(AUTH_URL + "?" + params)
+        self._toast(self.s("browser"))
+
+    def _logout(self, *_):
+        api.secrets.delete("refresh_token")
+        self._tok = None
+        self._exp = 0
+        self._toast(self.s("logged_out"))
+
+    # ----- настройки -----
+
+    def create_settings(self):
+        connected = bool(api.secrets.get("refresh_token"))
+        return [
+            Header(text=self.s("hdr")),
+            Input(key="client_id", text=self.s("client_id"), default=""),
+            Input(key="preset", text=self.s("preset"), default="banner"),
+            Text(text=self.s("redirect"), subtext=REDIRECT_URI,
+                 on_click=lambda *_: api.copy_text(REDIRECT_URI)),
+            Button(text=self.s("login"),
+                   subtext=self.s("on") if connected else self.s("off"),
+                   on_click=self._login),
+            Button(text=self.s("logout"), on_click=self._logout),
+        ]
