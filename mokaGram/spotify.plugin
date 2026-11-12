@@ -46,10 +46,7 @@ NOW_URL = "https://api.spotify.com/v1/me/player/currently-playing?additional_typ
 FORM = {"Content-Type": "application/x-www-form-urlencoded"}
 
 
-# =====================================================================
-# Рендер карточки (код из вложения; изменено: render_card принимает
-# готовую обложку, убрана демо-обложка с диска, добавлены шрифты)
-# =====================================================================
+# рендер карточки 
 
 DEFAULT = {
     'version': 2, 'theme': 'studio', 'preset': 'banner', 'width': 1500, 'height': 600,
@@ -256,12 +253,9 @@ def render_card(value, cover):
     return image
 
 
-# =====================================================================
-# Вспомогательные функции плагина
-# =====================================================================
+# вспомогательные функции плагина
 
 def _u16(s):
-    """Длина строки в UTF-16 code units (так считает Telegram)."""
     return len(s.encode("utf-16-le")) // 2
 
 
@@ -282,7 +276,6 @@ def _bar(progress, duration, width=12):
 
 
 class _Text:
-    """Накопитель текста с entities (смещения в UTF-16)."""
 
     def __init__(self):
         self.text = ""
@@ -308,7 +301,6 @@ class _Text:
 
 
 def track_info(data):
-    """Ответ currently-playing -> dict с полями трека или None."""
     item = (data or {}).get("item")
     if not item:
         return None
@@ -336,7 +328,6 @@ def track_info(data):
 
 
 def build_caption(info):
-    """⛧ <code>Трек — Артист</code> ⛧ -> (text, entities)."""
     name = info["title"]
     if info["artist"]:
         name += " — " + info["artist"]
@@ -348,9 +339,8 @@ def build_caption(info):
 
 
 def build_text_card(info):
-    """Запасной вариант без Pillow: текстовая карточка."""
     t = _Text()
-    t.add("🎧 ")
+    t.add("⛧ ")
     t.add("Сейчас играет" if info["playing"] else "На паузе", type="bold")
     t.add("\n")
     q = _u16(t.text)
@@ -371,7 +361,6 @@ def build_text_card(info):
 
 
 def render_jpeg(info, preset, cover_bytes):
-    """Рисует карточку и сохраняет во временный JPEG, возвращает путь."""
     cover = None
     if cover_bytes:
         try:
@@ -399,9 +388,7 @@ def render_jpeg(info, preset, cover_bytes):
     return path
 
 
-# =====================================================================
-# Плагин
-# =====================================================================
+# плагин
 
 class SpotifyNow(BasePlugin):
     strings = {
@@ -415,7 +402,7 @@ class SpotifyNow(BasePlugin):
             "on": "Подключено",
             "off": "Не подключено",
             "no_client": "Сначала вставь Client ID в настройках плагина",
-            "no_auth": "Spotify не подключён: Кастомизация → Плагины → Spotify Now",
+            "no_auth": "Spotify не подключён: Кастомизация → Плагины → Spotify",
             "nothing": "Сейчас ничего не играет",
             "browser": "Открыл браузер, подтверди доступ в Spotify",
             "port_busy": "Порт {} занят, закрой программу, которая его использует",
@@ -438,7 +425,7 @@ class SpotifyNow(BasePlugin):
             "on": "Connected",
             "off": "Not connected",
             "no_client": "Paste the Client ID in plugin settings first",
-            "no_auth": "Spotify is not connected: Customization → Plugins → Spotify Now",
+            "no_auth": "Spotify is not connected: Customization → Plugins → Spotify",
             "nothing": "Nothing is playing right now",
             "browser": "Browser opened, approve access in Spotify",
             "port_busy": "Port {} is busy, close the program using it",
@@ -459,7 +446,7 @@ class SpotifyNow(BasePlugin):
         self._exp = 0
         self._pending = {}
 
-    # ----- утилиты -----
+    # утилиты 
 
     def _toast(self, text):
         try:
@@ -490,7 +477,7 @@ class SpotifyNow(BasePlugin):
     def _client_id(self):
         return (self.get_setting("client_id", "") or "").strip()
 
-    # ----- токены -----
+    # токены
 
     async def _access_token(self):
         if self._tok and time.time() < self._exp - 30:
@@ -519,11 +506,9 @@ class SpotifyNow(BasePlugin):
             api.secrets.set("refresh_token", j["refresh_token"])
         return self._tok
 
-    # ----- отправка картинки -----
+    # отправка картинки
 
     def _send_photo(self, peer, path, caption, ents):
-        # send_file не принимает entities: запоминаем подпись, а когда сообщение
-        # уйдёт (on_message_sent), пробуем поправить её с моноширинным.
         self._pending[caption] = (str(peer), ents)
         if not api.send_file(peer, path, caption, as_photo=True):
             self._pending.pop(caption, None)
@@ -561,12 +546,10 @@ class SpotifyNow(BasePlugin):
             return None
         return resp.content
 
-    # ----- команда -----
+    # команда
 
     @command("now", "Карточка с текущим треком Spotify", aliases=["np"])
     async def now_cmd(self, ctx):
-        # Ошибки показываем тостом и ничего не возвращаем, чтобы текст ошибки
-        # не попал в поле ввода и случайно не ушёл в чат.
         for attempt in (1, 2):
             token = await self._access_token()
             if not token:
@@ -617,9 +600,9 @@ class SpotifyNow(BasePlugin):
 
         caption, ents = build_caption(info)
         self._send_photo(ctx.peer, path, caption, ents)
-        return ""  # команда исчезает из поля ввода, фото уже ушло
+        return ""  
 
-    # ----- авторизация (PKCE + локальный callback) -----
+    # авторизация
 
     def _login(self, *_):
         cid = self._client_id()
@@ -717,7 +700,7 @@ class SpotifyNow(BasePlugin):
         self._exp = 0
         self._toast(self.s("logged_out"))
 
-    # ----- настройки -----
+    # настройки
 
     def create_settings(self):
         connected = bool(api.secrets.get("refresh_token"))
