@@ -24,9 +24,9 @@ except Exception as _e:  # Pillow не загрузился: будет текс
 __id__ = "spotify"
 __name__ = "Spotify"
 __description__ = "Команда .now отправляет карточку с треком, который играет в Spotify"
-__author__ = "you"
-__version__ = "2.2.0"
-__icon__ = "<tg-emoji emoji-id="5276089339967716971">📣</tg-emoji>"
+__author__ = "@absolute_christian"
+__version__ = "1.0.0"
+__icon__ = "🎧"
 __permissions__ = ["network", "storage", "messages.send", "messages.read", "messages.edit"]
 __details__ = (
     "Как подключить:\n"
@@ -34,7 +34,7 @@ __details__ = (
     "2. После нажимаем Edit и меняем Redirect URL на http://127.0.0.1:8888/callback\n"
     "3. Копируем Client ID и в настройках плагина вставляем в свое место, потом подключаемся к Spotify по кнопке\n"
     "4. Когда играет песенка пишем в чатах .now и он дает секс карточку с твоей музыкой\n"
-    "Для создания карточки нужен Pillow, тутор - "
+    "Для создания карточки нужен Pillow, тутор - https://github.com/absolute-christian/Modules/blob/main/mokaGram/SpotifyREADME.md"
 )
 
 REDIRECT_PORT = 8888
