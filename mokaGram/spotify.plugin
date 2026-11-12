@@ -642,7 +642,7 @@ class SpotifyNow(BasePlugin):
                 result.update(dict(urllib.parse.parse_qsl(q.query)))
                 page = ("<!doctype html><meta charset='utf-8'>"
                         "<body style='font-family:sans-serif;text-align:center;margin-top:20vh'>"
-                        "<h2>Готово ✓</h2><p>Можно закрыть вкладку и вернуться в mokaGram.</p>")
+                        "<h2>Подключен</h2><p>Акк Spotify подключен к mokaGram</p>")
                 data = page.encode()
                 h.send_response(200)
                 h.send_header("Content-Type", "text/html; charset=utf-8")
